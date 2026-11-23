@@ -1,0 +1,6 @@
+.git
+.env
+__pycache__
+*.pyc
+test_bot.py
+README.md

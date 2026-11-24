@@ -1,327 +1,393 @@
-"""main.py — Qullamaggie Fused v2 · bot de señales (BingX perpetuos USDT → Telegram).
+"""Qullamaggie Fused Bot — escanea TODOS los perpetuos USDT de BingX y envía señales detalladas a Telegram.
 
-Cada vez que cierra una vela del timeframe, escanea TODAS las monedas cripto de BingX,
-reproduce la estrategia (EP Long + Parabolic Short) y avisa por Telegram con el detalle.
-Solo manda señales: no opera ni necesita API keys de BingX.
+Tareas concurrentes:
+  • cycle (cada cierre de vela): pre-filtro de candidatos -> replay exacto de la estrategia -> eventos a Telegram.
+  • live_loop (cada LIVE_POLL_SEC): vigila stop/TP1 de las posiciones virtuales abiertas con el precio en vivo.
+  • comandos de Telegram: /status /posiciones /watchlist /analiza /config /pausa /reanudar.
 """
-from __future__ import annotations
-
+import asyncio
+import json
 import logging
 import os
-import signal as sig_mod
-import sys
+import signal
 import time
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from bingx import BingXClient, BingXError
-from config import Config, is_excluded
-from state import State
-from strategy import (DAY_MS, MIN_MS, advance_position, compute_daily_ctx, evaluate,
-                      position_from_signal)
-from telegram_bot import (Telegram, format_event, format_radar, format_signal,
-                          format_startup, format_summary)
+import numpy as np
 
-log = logging.getLogger("qfused")
+import messages as M
+import strategy as S
+from bingx import BingX
+from config import cfg
+from telegram_bot import Telegram
 
-CONTRACTS_REFRESH_SEC = 6 * 3600
-ERROR_NOTIFY_SEC = 1800
+logging.basicConfig(level=getattr(logging, cfg.log_level, logging.INFO),
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("bot")
+
+DAY_MS = S.DAY_MS
+FINAL_TYPES = ("STOP", "BE_STOP", "TRAIL", "TIME")
+
+
+def tf_seconds(tf):
+    unit, val = tf[-1], int(tf[:-1])
+    return val * {"m": 60, "h": 3600, "d": 86400}[unit]
 
 
 class Bot:
-    def __init__(self, cfg: Config, client=None, tg=None, state_path: str | None = None):
-        self.cfg = cfg
-        self.tf_ms = cfg.tf_min * MIN_MS
-        self.client = client or BingXClient(rps=cfg.rps)
-        self.tg = tg or Telegram(cfg.telegram_token, cfg.telegram_chat_id)
-        self.state = State(state_path or os.path.join(cfg.state_dir, "qfused_state.json"))
-        self.contracts: dict = {}      # symbol -> {'qty_prec', 'min_qty'}
-        self.contracts_ts = 0.0
-        self.daily: dict = {}          # symbol -> [Bar diarias]
-        self.daily_day: dict = {}      # symbol -> día UTC (ms) de la última descarga diaria
-        self.daily_checked = False
-        self.first_cycle = True
-        self.stop = False
-        self._last_err_notify = 0.0
+    def __init__(self):
+        self.bx = BingX(cfg)
+        self.tg = Telegram(cfg.telegram_token, cfg.telegram_chat_id, cfg.telegram_thread_id)
+        self.tf_s = tf_seconds(cfg.timeframe)
+        self.tf_ms = self.tf_s * 1000
+        self.n_bars = min(1440, int(cfg.replay_days * 1440 / (self.tf_s / 60)) + 220)
+        self.universe_at = 0.0
+        self.daily = {}          # symbol -> series diarias
+        self.daily_day = None    # día UTC de la última carga diaria
+        self.prior_pot = set()   # símbolos con potencial en días previos de la ventana
+        self.seen = {}           # clave de evento -> timestamp (dedupe)
+        self.open_trades = {}
+        self.diags = {}          # symbol -> diagnóstico de la última vela (candidatos)
+        self.paused = False
+        self.counters = {"day": None, "entries": 0, "exits": 0}
+        self.last_stats = {"universe": 0, "daily_ok": 0, "cands": 0, "secs": 0.0, "entries": 0, "exits": 0}
+        self.last_heartbeat = time.time()
+        self.last_error_alert = 0.0
+        self.stop = asyncio.Event()
 
-    # ───────────────────────────── contratos ─────────────────────────────
-    def load_contracts(self):
-        raw = self.client.contracts()
-        out = {}
-        for c in raw:
-            sym = c.get("symbol")
-            if not sym or not sym.endswith("-USDT"):
-                continue
-            if str(c.get("status", "1")) != "1":
-                continue
-            if is_excluded(sym, self.cfg.exclude):
-                continue
-            info = {}
-            try:
-                info["qty_prec"] = int(float(c["quantityPrecision"]))
-            except (KeyError, TypeError, ValueError):
-                pass
-            for k in ("tradeMinQuantity", "tradeMinLimit"):
-                try:
-                    v = float(c[k])
-                    if v > 0:
-                        info["min_qty"] = v
-                        break
-                except (KeyError, TypeError, ValueError):
-                    pass
-            out[sym] = info
-        if not out:
-            raise BingXError("la lista de contratos llegó vacía")
-        self.contracts = out
-        self.contracts_ts = time.time()
-        log.info("Contratos USDT cripto activos: %d", len(out))
-
-    def select_symbols(self, tickers: dict) -> list:
-        out = []
-        for sym in self.contracts:
-            t = tickers.get(sym)
-            if t and t.get("qv") is not None and t["qv"] < self.cfg.min_quote_vol:
-                continue
-            out.append(sym)
-        return out
-
-    # ───────────────────────────── descarga ─────────────────────────────
-    def fetch(self, sym, need_daily, limit):
-        bars = self.client.klines(sym, self.cfg.timeframe, limit)
-        daily = None
-        if need_daily:
-            try:
-                daily = self.client.klines(sym, "1d", self.cfg.daily_bars)
-            except BingXError as e:
-                log.debug("1d %s falló: %s", sym, e)
-        return bars, daily
-
-    def _check_daily_alignment(self, daily):
-        if self.daily_checked or not daily:
-            return
-        self.daily_checked = True
-        off = daily[-1].ts % DAY_MS
-        if off == 0:
-            log.info("Velas 1d de BingX alineadas a 00:00 UTC ✔")
-        else:
-            msg = (f"⚠️ Las velas diarias de BingX NO empiezan a las 00:00 UTC (desfase {off / 3_600_000:.1f} h). "
-                   "El contexto diario puede ir desfasado respecto a TradingView.")
-            log.warning(msg)
-            self.tg.send(msg)
-
-    # ───────────────────────────── procesado ─────────────────────────────
-    def manage(self, pos, bars, ctx, d0):
-        """Avanza una señal abierta con las velas nuevas y avisa de TP1 / stop / trail."""
-        cfg = self.cfg
-        for idx, b in enumerate(bars):
-            if b.ts <= pos.last_ts:
-                continue
-            prev = bars[idx - 1] if idx > 0 else None
-            bday = b.ts - b.ts % DAY_MS
-            first_day = prev is not None and (prev.ts - prev.ts % DAY_MS) != bday
-            trail = pclose = None
-            if ctx is not None and bday == d0:
-                trail = ctx.ema10 if cfg.trail_ema_len == 10 else ctx.ema20
-                pclose = ctx.prior_close
-            for ev in advance_position(pos, b, cfg, self.tf_ms, first_day, pclose, trail):
-                self.tg.send(format_event(pos, ev, cfg))
-                if pos.closed:
-                    self.state.close_position(pos, ev.kind, ev.ts)
-            if pos.closed:
-                return
-        self.state.dirty = True
-
-    def process(self, sym, bars_raw, daily_raw, day0, now_ms, stats, radar_ep, radar_ps):
-        cfg, tf_ms = self.cfg, self.tf_ms
-        if daily_raw:
-            self.daily[sym] = daily_raw
-            self.daily_day[sym] = day0
-            self._check_daily_alignment(daily_raw)
-
-        bars = [b for b in bars_raw if b.ts + tf_ms <= now_ms]  # solo velas cerradas
-        if len(bars) < 40:
-            stats["pocas_velas"] += 1
-            return
-        last = bars[-1]
-        if last.ts < (now_ms // tf_ms) * tf_ms - tf_ms:
-            stats["velas_atrasadas"] += 1
-        d0 = last.ts - last.ts % DAY_MS
-        daily = self.daily.get(sym)
-        ctx = compute_daily_ctx(daily, d0, cfg.ps_lookback) if daily else None
-
-        pos = self.state.positions.get(sym)
-        if pos is not None:
-            self.manage(pos, bars, ctx, d0)
-        if ctx is None:
-            stats["sin_contexto_diario"] += 1
-            return
-
-        res = evaluate(sym, bars, ctx, cfg, cfg.tf_min, blocked=sym in self.state.positions)
-        stats["analizadas"] += 1
-        if res.ep_armed:
-            stats["ep_armados"] += 1
-        if res.ps_active:
-            stats["ps_activos"] += 1
-
-        age_ms = cfg.max_signal_age_bars * tf_ms
-        sent_signal = False
-        for s in res.signals:
-            if s.ts < last.ts - age_ms or sym in self.state.positions:
-                continue
-            if not self.state.once(f"sig|{sym}|{s.setup}|{s.ts}"):
-                continue
-            self.state.positions[sym] = position_from_signal(s)
-            self.tg.send(format_signal(s, cfg, self.contracts.get(sym)))
-            self.state.save()
-            stats["señales"] += 1
-            sent_signal = True
-
-        if sent_signal:  # la moneda ya tuvo señal hoy: que no aparezca también en el radar
-            self.state.once(f"radar|{d0}|{sym}|EP")
-            self.state.once(f"radar|{d0}|{sym}|PS")
-        if not cfg.send_radar or sent_signal or sym in self.state.positions:
-            return
-        if res.ep_armed and res.ep_arm_info and cfg.setups in ("BOTH", "EP"):
-            fresh = res.ep_arm_ts is not None and res.ep_arm_ts >= last.ts - age_ms
-            if (fresh or self.first_cycle) and self.state.once(f"radar|{d0}|{sym}|EP"):
-                i, now = res.ep_arm_info, res.last
-                radar_ep.append({"sym": sym, "move": max(now["chg"], now["gap"]), "rvol": now["rvol"],
-                                 "adr": i["adr"], "or_h": now["or_h"], "stop_est": i.get("stop_est")})
-        if res.ps_active and res.ps_info and cfg.setups in ("BOTH", "PS"):
-            fresh = res.ps_first_ts is not None and res.ps_first_ts >= last.ts - age_ms
-            if (fresh or self.first_cycle) and self.state.once(f"radar|{d0}|{sym}|PS"):
-                now = res.last
-                radar_ps.append({"sym": sym, "gain": now["gain"], "green": now["green"], "ext": now["ext"],
-                                 "or_l": now["or_l"], "lookback": cfg.ps_lookback})
-
-    # ───────────────────────────── ciclo ─────────────────────────────
-    def maybe_daily_summary(self, day0):
-        prev = self.state.meta.get("summary_day")
-        self.state.meta["summary_day"] = day0
-        if prev is None or prev >= day0 or not self.cfg.send_daily_summary:
-            return
-        msg = format_summary(self.state, prev, day0)
-        if msg:
-            self.tg.send(msg, silent=True)
-
-    def cycle(self, now_ms: int | None = None):
-        cfg, tf_ms = self.cfg, self.tf_ms
-        t0 = time.time()
-        now_ms = int(now_ms if now_ms is not None else t0 * 1000)
-        exp_ts = (now_ms // tf_ms) * tf_ms - tf_ms          # apertura de la última vela cerrada
-        day0 = exp_ts - exp_ts % DAY_MS
-
-        if not self.contracts or t0 - self.contracts_ts > CONTRACTS_REFRESH_SEC:
-            try:
-                self.load_contracts()
-            except BingXError as e:
-                if not self.contracts:
-                    raise
-                log.warning("No pude refrescar contratos (%s); sigo con la lista anterior", e)
+    # ───────────── estado (dedupe) ─────────────
+    def load_state(self):
         try:
-            tickers = self.client.tickers()
-        except BingXError as e:
-            log.warning("tickers falló (%s); sin filtro de liquidez este ciclo", e)
-            tickers = {}
+            with open(cfg.state_path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            self.seen = {k: int(v) for k, v in d.get("seen", {}).items()}
+            log.info("Estado cargado: %d eventos vistos", len(self.seen))
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log.warning("No se pudo leer el estado: %s", e)
 
-        symbols = self.select_symbols(tickers)
-        for s in self.state.positions:           # siempre gestionar las señales abiertas
-            if s not in symbols and s in self.contracts:
-                symbols.append(s)
-        self.maybe_daily_summary(day0)
+    def save_state(self):
+        try:
+            cutoff = int(time.time()) - 5 * 86400
+            self.seen = {k: v for k, v in self.seen.items() if v >= cutoff}
+            folder = os.path.dirname(cfg.state_path)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            tmp = cfg.state_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"seen": self.seen}, f)
+            os.replace(tmp, cfg.state_path)
+        except Exception as e:
+            log.debug("No se pudo guardar el estado: %s", e)
 
-        bars_needed = int((exp_ts - day0) // tf_ms) + 1 + cfg.warmup_bars
-        limit = max(60, min(1440, bars_needed))
+    # ───────────── datos ─────────────
+    async def refresh_daily(self, today, now_ms):
+        log.info("Descargando velas diarias de %d pares...", len(self.bx.symbols))
+        t0 = time.time()
 
-        stats, radar_ep, radar_ps = Counter(), [], []
-        with ThreadPoolExecutor(max_workers=cfg.concurrency) as ex:
-            futs = {ex.submit(self.fetch, s, self.daily_day.get(s) != day0, limit): s for s in symbols}
-            for fut in as_completed(futs):
-                if self.stop:
-                    break
-                sym = futs[fut]
-                try:
-                    bars_raw, daily_raw = fut.result()
-                except Exception as e:
-                    stats["errores_api"] += 1
-                    log.debug("fetch %s: %s", sym, e)
-                    continue
-                try:
-                    self.process(sym, bars_raw, daily_raw, day0, now_ms, stats, radar_ep, radar_ps)
-                except Exception:
-                    stats["errores_proceso"] += 1
-                    log.exception("Error procesando %s", sym)
-
-        if radar_ep or radar_ps:
-            radar_ep.sort(key=lambda x: -(x["move"] or 0))
-            radar_ps.sort(key=lambda x: -(x["gain"] or 0))
-            self.tg.send(format_radar(radar_ep, radar_ps, cfg, exp_ts + tf_ms, cfg.radar_max), silent=True)
-
-        self.state.prune()
-        self.state.save()
-        dt = time.time() - t0
-        log.info("Ciclo %s UTC: %d/%d monedas · EP armados %d · PS activos %d · señales %d · "
-                 "abiertas %d · errores API %d · %.0fs",
-                 time.strftime("%H:%M", time.gmtime(exp_ts / 1000 + cfg.tf_min * 60)),
-                 stats["analizadas"], len(symbols), stats["ep_armados"], stats["ps_activos"],
-                 stats["señales"], len(self.state.positions), stats["errores_api"], dt)
-        if stats:
-            log.debug("Detalle: %s", dict(stats))
-        if symbols and stats["errores_api"] > 0.5 * len(symbols):
-            self.notify_error(f"⚠️ BingX respondió con errores en {stats['errores_api']}/{len(symbols)} monedas. "
-                              "Sigo reintentando en el próximo ciclo.")
-        if dt > cfg.tf_min * 60:
-            log.warning("El ciclo tardó %.0fs (> %dm). Baja MIN_QUOTE_VOL_24H o sube API_RPS.", dt, cfg.tf_min)
-        self.first_cycle = False
-        return stats
-
-    # ───────────────────────────── bucle ─────────────────────────────
-    def notify_error(self, text):
-        if time.time() - self._last_err_notify > ERROR_NOTIFY_SEC:
-            self._last_err_notify = time.time()
-            self.tg.send(text, silent=True)
-
-    def sleep_until_next_close(self):
-        tf = self.tf_ms / 1000.0
-        target = (time.time() // tf + 1) * tf + self.cfg.candle_delay_sec
-        while not self.stop and time.time() < target:
-            time.sleep(min(1.0, max(0.0, target - time.time())))
-
-    def run(self):
-        for s in (sig_mod.SIGTERM, sig_mod.SIGINT):
-            sig_mod.signal(s, lambda *_: setattr(self, "stop", True))
-        while not self.stop:
+        async def one(sym):
             try:
-                self.load_contracts()
-                break
-            except BingXError as e:
-                log.error("No pude cargar los contratos de BingX: %s. Reintento en 30 s", e)
-                time.sleep(30)
-        if self.stop:
-            return
-        if self.cfg.send_startup:
-            note = f"Estado persistente: {os.path.dirname(os.path.abspath(self.state.path))}"
-            self.tg.send(format_startup(self.cfg, len(self.select_symbols({})), note), silent=True)
-        while not self.stop:
-            try:
-                self.cycle()
+                raw = await self.bx.fetch_ohlcv(sym, "1d", 150)
             except Exception as e:
-                log.exception("Error en el ciclo")
-                self.notify_error(f"⚠️ Error en el ciclo: {type(e).__name__}: {str(e)[:200]}")
-            if self.cfg.run_once:
+                log.debug("Diario %s falló: %s", sym, e)
+                return sym, None
+            if raw is None:
+                return sym, None
+            raw = raw[raw[:, 0] + DAY_MS <= now_ms]  # solo velas diarias cerradas
+            return (sym, raw) if len(raw) >= 35 else (sym, None)
+
+        res = await asyncio.gather(*(one(s) for s in self.bx.symbols))
+        daily, pot, misaligned = {}, set(), 0
+        for sym, raw in res:
+            if raw is None:
+                continue
+            if raw[-1, 0] % DAY_MS != 0:
+                misaligned += 1
+            ds = S.daily_series(raw[:, 0], raw[:, 1], raw[:, 2], raw[:, 3], raw[:, 4], raw[:, 5], cfg.ps_lookback)
+            daily[sym] = ds
+            if S.prior_days_potential(ds, cfg, today):
+                pot.add(sym)
+        if daily and misaligned > len(daily) * 0.5:
+            log.warning("Las velas diarias de BingX no parecen alineadas a 00:00 UTC (%d/%d). "
+                        "Revisa el cálculo de contexto diario.", misaligned, len(daily))
+        self.daily, self.prior_pot, self.daily_day = daily, pot, today
+        log.info("Diario listo: %d pares con histórico (%d con potencial previo) en %.0fs",
+                 len(daily), len(pot), time.time() - t0)
+
+    def select_candidates(self, tickers, today):
+        cands = []
+        for sym in self.bx.symbols:
+            ds = self.daily.get(sym)
+            t = tickers.get(sym)
+            if ds is None or not t:
+                continue
+            if cfg.min_quote_volume > 0 and (t.get("quoteVolume") or 0) < cfg.min_quote_volume:
+                continue
+            hi = t.get("high")
+            if sym in self.prior_pot or (hi and S.could_signal(S.ctx_for_day(ds, today), float(hi), cfg)):
+                cands.append(sym)
+        return cands
+
+    async def replay_symbol(self, sym, now_ms, ds=None):
+        raw = await self.bx.fetch_ohlcv(sym, cfg.timeframe, self.n_bars)
+        if raw is None:
+            raise ValueError("sin velas")
+        raw = raw[raw[:, 0] + self.tf_ms <= now_ms]  # descarta la vela en formación
+        if len(raw) < 100:
+            raise ValueError("pocas velas")
+        bars = (raw[:, 0].astype(np.int64), raw[:, 1], raw[:, 2], raw[:, 3], raw[:, 4], raw[:, 5])
+        return S.replay(sym, bars, ds if ds is not None else self.daily[sym], cfg, self.tf_ms)
+
+    # ───────────── entrega ─────────────
+    async def deliver(self, ev, now_ms, series=None):
+        """Envía un evento (con gráfico en las entradas). True si el texto se entregó."""
+        text = M.format_event(ev, cfg, now_ms)
+        if ev["type"] == "ENTRY" and cfg.send_charts and series is not None:
+            try:
+                from charts import render_entry_chart
+                png = await asyncio.to_thread(render_entry_chart, series, ev, cfg)
+                await self.tg.send_photo(png, caption=text.split("\n")[0])
+            except Exception as e:
+                log.warning("No se pudo generar/enviar el gráfico: %s", e)
+        return await self.tg.send(text)
+
+    async def emit(self, ev, now_ms, series=None):
+        """Dedupe + envío. La clave se marca ANTES de enviar (evita carreras) y se revierte si falla."""
+        key = f"{ev['symbol']}|{ev['signal_ts']}|{ev['type']}"
+        if key in self.seen:
+            return False
+        self.seen[key] = int(time.time())
+        if now_ms - ev["event_ts"] > cfg.max_event_age_bars * self.tf_ms:
+            return False  # antiguo: marcado como visto sin enviarlo
+        if self.paused or (ev["type"] != "ENTRY" and not cfg.send_exit_updates):
+            return False
+        ok = await self.deliver(ev, now_ms, series)
+        if not ok:
+            self.seen.pop(key, None)  # se reintentará en el siguiente ciclo
+            return False
+        self.counters["entries" if ev["type"] == "ENTRY" else "exits"] += 1
+        log.info("SEÑAL %s %s %s%s", ev["type"], ev["setup"], ev["symbol"], " (vivo)" if ev.get("live") else "")
+        return True
+
+    # ───────────── ciclo principal ─────────────
+    async def cycle(self):
+        t0 = time.time()
+        now_ms = int(t0 * 1000)
+        today = now_ms // DAY_MS
+        if self.counters["day"] != today:
+            self.counters.update(day=today, entries=0, exits=0)
+        if not self.bx.symbols or t0 - self.universe_at > 6 * 3600:
+            await self.bx.load_universe()
+            self.universe_at = t0
+        if self.daily_day != today:
+            await self.refresh_daily(today, now_ms)
+
+        tickers = await self.bx.fetch_tickers()
+        cands = self.select_candidates(tickers, today)
+
+        async def work(sym):
+            try:
+                return sym, await self.replay_symbol(sym, now_ms), None
+            except Exception as e:
+                return sym, None, f"{type(e).__name__}: {e}"
+
+        results = await asyncio.gather(*(work(s) for s in cands))
+
+        errors = [(s, e) for s, r, e in results if e]
+        opens, diags, pending = {}, {}, []
+        for sym, res, err in results:
+            if res is None:
+                continue
+            if res["open_trade"]:
+                opens[sym] = res["open_trade"]
+            if "diag" in res:
+                diags[sym] = res["diag"]
+            for ev in res["events"]:
+                pending.append((ev, res["series"]))
+        self.open_trades, self.diags = opens, diags
+
+        pending.sort(key=lambda x: x[0]["event_ts"])
+        sent = 0
+        for ev, series in pending:
+            if await self.emit(ev, now_ms, series):
+                sent += 1
+        self.save_state()
+
+        secs = time.time() - t0
+        self.last_stats = {"universe": len(self.bx.symbols), "daily_ok": len(self.daily), "cands": len(cands),
+                           "secs": secs, "entries": self.counters["entries"], "exits": self.counters["exits"]}
+        log.info("Ciclo OK · universo=%d candidatos=%d abiertas=%d enviados=%d errores=%d · %.1fs",
+                 len(self.bx.symbols), len(cands), len(opens), sent, len(errors), secs)
+        if len(cands) >= 8 and len(errors) > len(cands) * 0.3:
+            await self.alert(f"{len(errors)}/{len(cands)} pares fallaron. Ej.: {errors[0][0]} -> {errors[0][1]}")
+
+        if cfg.heartbeat_hours > 0 and time.time() - self.last_heartbeat >= cfg.heartbeat_hours * 3600:
+            self.last_heartbeat = time.time()
+            await self.tg.send(M.heartbeat(self.last_stats, self.open_trades, cfg, self.paused))
+
+    # ───────────── vigilancia casi en vivo ─────────────
+    async def live_check(self, tickers):
+        now_ms = int(time.time() * 1000)
+        bar_ts = now_ms - now_ms % self.tf_ms
+        pfrac = cfg.partial_pct / 100.0
+        for sym, o in list(self.open_trades.items()):
+            if o.get("pending"):
+                continue  # la entrada aún no se ha ejecutado
+            k = f"{sym}|{o['signal_ts']}|"
+            if any((k + t) in self.seen for t in FINAL_TYPES):
+                continue
+            tk = tickers.get(sym) or {}
+            if not tk.get("last"):
+                continue
+            last, s = float(tk["last"]), o["side"]
+            tp_done = o["partial_taken"] or (k + "TP1") in self.seen
+            stop_lvl = o["fill"] if tp_done else o["stop_init"]
+            if (last <= stop_lvl) if s == 1 else (last >= stop_lvl):
+                kind, px, frac = ("BE_STOP" if tp_done else "STOP"), stop_lvl, (1.0 - pfrac if tp_done else 1.0)
+            elif not tp_done and ((last >= o["tp1"]) if s == 1 else (last <= o["tp1"])):
+                kind, px, frac = "TP1", o["tp1"], pfrac
+            else:
+                continue
+            if (k + kind) in self.seen:
+                continue
+            base_r = o["realized_r"] if o["partial_taken"] else (
+                pfrac * s * (o["tp1"] - o["fill"]) / o["risk"] if tp_done else 0.0)
+            r_part = s * (px - o["fill"]) / o["risk"]
+            ev = {"type": kind, "symbol": sym, "setup": o["setup"], "side": s, "signal_ts": o["signal_ts"],
+                  "bar_ts": bar_ts, "event_ts": now_ms, "price": px, "frac": frac, "r_part": r_part,
+                  "r_total": base_r + frac * r_part, "fill": o["fill"], "stop_init": o["stop_init"],
+                  "tp1": o["tp1"], "risk": o["risk"], "live": True}
+            if kind == "TP1":
+                ev["remaining"] = 1.0 - pfrac
+            await self.emit(ev, now_ms)
+
+    async def live_loop(self):
+        if cfg.live_poll_sec <= 0 or not cfg.send_exit_updates:
+            return
+        while not self.stop.is_set():
+            try:
+                await asyncio.wait_for(self.stop.wait(), timeout=cfg.live_poll_sec)
+                return
+            except asyncio.TimeoutError:
+                pass
+            if not self.open_trades or self.paused:
+                continue
+            try:
+                await self.live_check(await self.bx.fetch_tickers())
+            except Exception as e:
+                log.debug("live_check: %s", e)
+
+    # ───────────── comandos de Telegram ─────────────
+    def _resolve(self, arg):
+        a = arg.upper().replace("-", "/").strip()
+        for suf in ("/USDT:USDT", "/USDT", "USDT"):
+            if a.endswith(suf) and len(a) > len(suf):
+                a = a[: -len(suf)]
                 break
-            self.sleep_until_next_close()
-        self.state.save()
-        log.info("Bot detenido")
+        for sym in self.bx.symbols:
+            if sym.split("/")[0].upper() == a:
+                return sym
+        return None
+
+    async def analyze(self, arg):
+        sym = self._resolve(arg)
+        if not sym:
+            return f"❓ No encuentro «{M.esc(arg)}» entre los perpetuos USDT analizados."
+        ds = self.daily.get(sym)
+        now_ms = int(time.time() * 1000)
+        if ds is None:
+            raw = await self.bx.fetch_ohlcv(sym, "1d", 150)
+            raw = raw[raw[:, 0] + DAY_MS <= now_ms] if raw is not None else None
+            if raw is None or len(raw) < 35:
+                return "ℹ️ Ese par no tiene histórico diario suficiente (mín. 35 días)."
+            ds = S.daily_series(raw[:, 0], raw[:, 1], raw[:, 2], raw[:, 3], raw[:, 4], raw[:, 5], cfg.ps_lookback)
+        res = await self.replay_symbol(sym, now_ms, ds)
+        if "diag" not in res:
+            return "ℹ️ No hay velas suficientes para analizar ese par."
+        return M.analysis(sym, res["diag"], cfg)
+
+    async def on_command(self, text):
+        parts = text.split()
+        cmd = parts[0].split("@")[0].lower()
+        if cmd in ("/start", "/help", "/ayuda"):
+            return M.help_text()
+        if cmd == "/status":
+            return M.heartbeat(self.last_stats, self.open_trades, cfg, self.paused)
+        if cmd in ("/posiciones", "/positions"):
+            return M.open_positions(self.open_trades)
+        if cmd == "/watchlist":
+            return M.watchlist(self.diags, cfg)
+        if cmd == "/config":
+            return M.startup(cfg, len(self.bx.symbols))
+        if cmd == "/pausa":
+            self.paused = True
+            return "⏸ Señales en pausa. El bot sigue analizando; usa /reanudar para volver a recibirlas."
+        if cmd == "/reanudar":
+            self.paused = False
+            return "▶️ Señales reactivadas."
+        if cmd in ("/analiza", "/analyze"):
+            if len(parts) < 2:
+                return "Uso: /analiza BTC"
+            return await self.analyze(parts[1])
+        return "Comando no reconocido. /ayuda para ver la lista."
+
+    # ───────────── ejecución ─────────────
+    async def alert(self, text):
+        if time.time() - self.last_error_alert < 1800:
+            return
+        self.last_error_alert = time.time()
+        await self.tg.send(M.error_alert(text))
+
+    async def run(self):
+        self.load_state()
+        await self.tg.start()
+        while not self.stop.is_set():  # el universo debe cargar antes de arrancar
+            try:
+                await self.bx.load_universe()
+                self.universe_at = time.time()
+                break
+            except Exception as e:
+                log.error("No se pudo cargar el universo de BingX: %s", e)
+                await self.alert(f"No se puede conectar con BingX: {e}. Si persiste, cambia la región del servicio en Railway.")
+                await asyncio.sleep(60)
+        if not self.stop.is_set():
+            await self.tg.send(M.startup(cfg, len(self.bx.symbols)) + ("\n• Comandos: /ayuda" if cfg.commands_enabled else ""))
+
+        tasks = [asyncio.create_task(self.live_loop())]
+        if cfg.commands_enabled:
+            tasks.append(asyncio.create_task(self.tg.poll_commands(self.on_command, self.stop)))
+
+        while not self.stop.is_set():
+            try:
+                await self.cycle()
+            except Exception as e:
+                log.exception("Fallo en el ciclo")
+                await self.alert(f"{type(e).__name__}: {e}")
+            now = time.time()
+            nxt = (int(now) // self.tf_s + 1) * self.tf_s + cfg.bar_close_delay
+            try:
+                await asyncio.wait_for(self.stop.wait(), timeout=max(1.0, nxt - now))
+            except asyncio.TimeoutError:
+                pass
+
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await self.tg.close()
+        await self.bx.close()
+        log.info("Bot detenido.")
 
 
-def main():
-    cfg = Config.from_env()
-    logging.basicConfig(level=getattr(logging, cfg.log_level, logging.INFO),
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s", stream=sys.stdout)
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
-    Bot(cfg).run()
+async def main():
+    bot = Bot()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, bot.stop.set)
+        except NotImplementedError:
+            pass
+    await bot.run()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

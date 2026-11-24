@@ -1,13 +1,7 @@
-# Imagen oficial de Python: evita el instalador mise/runtime.txt que falló en Railway.
 FROM python:3.12-slim
-
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
-
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 MPLBACKEND=Agg
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-
-CMD ["python", "-u", "main.py"]
+CMD ["python", "main.py"]

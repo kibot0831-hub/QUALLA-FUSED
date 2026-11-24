@@ -1,51 +1,116 @@
-# Qullamaggie Fused v2 — bot de señales (BingX → Telegram)
+# Qullamaggie Fused Bot — BingX → Telegram
 
-Port del Pine v6 **"Qullamaggie Fused v2 - EP Long + Parabolic Short"**.
-Cada vez que cierra una vela (15m por defecto) escanea **todos los perpetuos USDT cripto de BingX**
-y avisa por Telegram. **Solo manda señales: no opera y no necesita API keys de BingX.**
+Conversión a bot del script Pine **"Qullamaggie Fused v2 (EP Long + Parabolic Short)"**.
+Escanea **todos los perpetuos USDT de BingX**, aplica la misma lógica vela a vela y envía **señales detalladas a Telegram**:
+gráfico, entrada, stop, TP1, tamaño sugerido, contexto, niveles y avisos de TP1 / stop / BE / trail EMA / tiempo.
 
-## Qué te llega a Telegram
-| Mensaje | Cuándo |
-|---|---|
-| 🟢 **EP LONG** / 🔴 **PARABOLIC SHORT** | Entrada: niveles (entrada, stop, TP1 a +1.8R), tamaño sugerido, contexto (cambio, gap, RVOL, ADR, OR, VWAP, EMA21 / subida, días verdes, extensión EMA20d), gatillo y plan de gestión |
-| 🎯 TP1 · 🛑 Stop · ⚪ BE · 🔄 Trail EMA · ⏳ Tiempo | Seguimiento de cada señal abierta, con el R realizado |
-| 👀 **RADAR** | Monedas recién "armadas" (EP) o con contexto parabólico activo y que aún esperan gatillo, con el nivel exacto a romper |
-| 📊 Resumen diario | A las 00:00 UTC: señales del día anterior y R total |
+> ⚠️ El bot **solo envía señales**; no opera por ti y no necesita API keys de BingX (solo datos públicos).
+> Información con fines educativos, no es asesoramiento financiero. Haz backtest y prueba en demo antes de arriesgar dinero.
 
 ## Archivos (todos en la raíz, sin carpetas)
-`main.py` (bucle) · `strategy.py` (la estrategia) · `bingx.py` (datos públicos) · `telegram_bot.py` (mensajes)
-· `state.py` (JSON persistente) · `config.py` (variables) · `test_bot.py` · `Dockerfile` · `railway.toml`
-· `requirements.txt` · `.env.example` · `.gitignore` · `.dockerignore`
 
-## Subir a GitHub
+| Archivo | Función |
+|---|---|
+| `main.py` | Bucle principal, monitor en vivo, comandos, dedupe |
+| `strategy.py` | Réplica vela a vela de la estrategia Pine |
+| `indicators.py` | EMA, ATR, SMA… equivalentes a Pine |
+| `bingx.py` | Datos de BingX (ccxt) |
+| `charts.py` | Gráfico PNG de cada entrada |
+| `messages.py` | Formato de los mensajes |
+| `telegram_bot.py` | Mensajes, fotos y comandos de Telegram |
+| `config.py` | Parámetros por variables de entorno |
+| `backtest.py` | Backtest con el mismo motor (se ejecuta en tu PC) |
+| `requirements.txt`, `Dockerfile`, `railway.json` | Despliegue en Railway |
+| `.env.example`, `.gitignore` | Plantilla de variables / ignorados |
+
+## 1) Telegram
+
+1. En Telegram habla con **@BotFather** → `/newbot` → copia el **token**.
+2. Escribe cualquier mensaje a tu bot (o añádelo a tu grupo/canal como administrador).
+3. Obtén tu **chat id**: abre `https://api.telegram.org/bot<TOKEN>/getUpdates` y busca `"chat":{"id": ...}`
+   (en grupos/canales es un número negativo, p. ej. `-100123...`).
+
+## 2) GitHub
+
+Crea un repositorio nuevo y sube **todos los archivos tal cual, en la raíz** (Add file → Upload files).
+No subas ningún `.env` con tus claves.
+
+## 3) Railway
+
+1. [railway.com](https://railway.com) → **New Project → Deploy from GitHub repo** → elige el repositorio.
+   Railway detecta el `Dockerfile` y `railway.json` (es un *worker*, no necesita puerto ni dominio).
+2. Pestaña **Variables**: añade como mínimo `TELEGRAM_BOT_TOKEN` y `TELEGRAM_CHAT_ID`
+   (el resto es opcional; ver `.env.example`).
+3. **Settings → Region**: si en los logs ves errores 403/451 o "restricted location" al conectar con BingX,
+   cambia la región del servicio (Europa o Singapur suelen funcionar).
+4. Deploy. Debería llegarte **"🤖 Qullamaggie Fused Bot — iniciado"**.
+
+*Opcional:* para conservar el registro de avisos entre reinicios, añade un **Volume** montado en `/data`
+y la variable `STATE_PATH=/data/state.json`. Sin volumen funciona igual (tras un redeploy podrían repetirse
+avisos de los últimos `MAX_EVENT_AGE_BARS` velas).
+
+## Qué recibes
+
+- **Entrada**: foto con velas, VWAP, EMA21, Opening Range, entrada, stop y TP1 + mensaje con operación, riesgo y tamaño,
+  contexto (movimiento, RVOL, ADR, subida, verdes, extensión), niveles y enlaces a BingX/TradingView.
+- **Seguimiento**: 🎯 TP1 · 🛑 Stop · ⚖️ BE · 🔔 Trail EMA · ⏱ Tiempo, con el resultado en R.
+- **Alertas en vivo ⚡**: cada `LIVE_POLL_SEC` (20 s) se compara el precio en vivo con el stop y el TP1 de las posiciones
+  abiertas, sin esperar al cierre de la vela. Se confirman después con la vela cerrada (sin duplicar el aviso).
+
+## Comandos de Telegram
+
+Solo responden en el chat configurado.
+
+| Comando | Qué hace |
+|---|---|
+| `/status` | Estado, nº de candidatos, señales de hoy, posiciones abiertas |
+| `/posiciones` | Posiciones virtuales abiertas (entrada, stop, TP1, estado) |
+| `/watchlist` | Pares **armados** (EP) o con contexto Parabolic Short, con la distancia al gatillo |
+| `/analiza BTC` | Diagnóstico de un par: qué condiciones cumple (✅/❌) y por qué no hay señal |
+| `/config` | Parámetros activos |
+| `/pausa` · `/reanudar` | Silenciar / reactivar las señales (el bot sigue analizando) |
+
+## Backtest
+
+Se ejecuta en tu ordenador con el **mismo motor** que el bot y las mismas variables de entorno:
+
 ```bash
-git init && git add . && git commit -m "Qullamaggie Fused v2 bot"
-git branch -M main
-git remote add origin https://github.com/TU_USUARIO/TU_REPO.git
-git push -u origin main
+pip install -r requirements.txt
+python backtest.py --symbols BTC,ETH,SOL --days 14
+python backtest.py --top 30 --days 30 --csv operaciones.csv
+EP_MIN_RVOL=2 EP_TRIGGER=HH python backtest.py --top 30 --days 30     # probar parámetros
 ```
 
-## Railway
-1. **New Project → Deploy from GitHub repo** → elige el repo. Railway detecta el `Dockerfile` (no usa mise ni `runtime.txt`).
-2. **Variables**: añade `TELEGRAM_BOT_TOKEN` y `TELEGRAM_CHAT_ID`. El resto es opcional (ver `.env.example`; los valores por defecto son los inputs del Pine).
-3. **Volume** (recomendado): servicio → *Settings → Volumes → Add* con mount path `/data`. Así las señales abiertas y la deduplicación sobreviven a los redeploys (el bot detecta el volumen solo).
-4. No añadas *Custom Start Command* ni `Procfile`: el arranque es el `CMD` del Dockerfile.
-5. En *Logs* verás una línea por ciclo: `Ciclo 12:15 UTC: 480/487 monedas · EP armados 3 · PS activos 0 · señales 1 …`
+Muestra por setup: nº de operaciones, % de aciertos, % que llegan a TP1, R medio, R total, profit factor y drawdown máximo
+(en múltiplos de R, descontando `--costs-pct`, 0.1 % por operación por defecto).
+Si no hay operaciones, amplía los días/pares o relaja los umbrales.
 
-## Cómo se ha trasladado el Pine
-- Solo velas **cerradas**. Contexto diario = valores `[1]` con días completos (cierre previo, ADR20, volumen medio 20d, EMA10/20, racha verde, mínimo de `PS_LOOKBACK` días).
-- Día = **UTC** (`SESS_OFFSET_MIN=0`), Opening Range = primeros `OR_MINUTES`, RVOL a esta hora, ventana de entradas, máx. trades/día, stop estructural (día / OR / ATR×2) con filtro de ancho máximo en ADR, dimensionado por riesgo % con tope de nocional.
-- El día actual se **reproduce vela a vela** en cada ciclo (EP armado, trades ya hechos, gatillos con cruce), igual que lo haría el Pine en el gráfico.
-- Tamaño sugerido con `ACCOUNT_EQUITY` fijo (el Pine usa el equity del backtest, que va cambiando).
-- Seguimiento de señales (convenciones prudentes): si una vela toca stop y TP1 a la vez, cuenta el stop; con gap se ejecuta en la apertura; tras TP1 el stop pasa a BE desde la vela siguiente; el trail diario se evalúa al abrir cada día UTC.
-- Entrada = cierre de la vela de señal (precio de referencia a mercado). El Pine real entra en la apertura siguiente.
+## Cómo funciona
 
-## Ajustes útiles
-- `MIN_QUOTE_VOL_24H=0` analiza literalmente todas las monedas (más lento y más ruido en monedas muertas).
-- Si el ciclo tarda más que el timeframe (aviso en logs): sube `API_RPS` (BingX limita las peticiones por IP; empieza con 8-10) o sube `MIN_QUOTE_VOL_24H`.
-- `SETUPS=EP` o `SETUPS=PS` para activar solo un setup. `SEND_RADAR=false` si prefieres solo entradas.
+Cada cierre de vela del `TIMEFRAME` (por defecto 5m):
 
-## Tests (sin red)
-```bash
-pip install -r requirements.txt && python -m unittest -v test_bot
-```
+1. **Pre-filtro barato**: un único `fetch_tickers` + contexto diario en caché (descarga diaria una vez por día UTC) para
+   quedarse solo con pares que *pueden* cumplir el contexto EP/PS (superconjunto conservador: nunca descarta un candidato válido).
+2. **Replay exacto** de los candidatos (últimos `REPLAY_DAYS` días): Opening Range, VWAP por día, EMA21, ATR, RVOL a esa hora,
+   `epArmed`, gatillos, stops estructurales, filtro ADR, `maxTradesDay`, parcial, BE, trail EMA diaria…
+3. **Eventos nuevos → Telegram**, deduplicados. Si un envío falla, se reintenta en el siguiente ciclo.
+
+El motor no guarda estado de la estrategia: se re-simula cada vez, así que se recupera solo tras un reinicio.
+
+## Diferencias respecto a TradingView (conviene saberlas)
+
+- **Entradas a mercado**: la señal sale al cierre de la vela confirmada; el precio mostrado es ese cierre (TradingView ejecuta en la apertura siguiente + slippage).
+- Las alertas ⚡ usan el último precio del ticker (cada 20 s): pueden perderse una mecha entre dos consultas, que se detectaría al cierre de la vela. Coloca siempre el stop y el TP1 como órdenes en BingX al entrar.
+- Si stop y objetivo caen en la misma vela se asume **stop primero** (conservador).
+- Tamaño sugerido calculado con `ACCOUNT_EQUITY` fijo (en Pine usa el equity dinámico). Ajústalo al paso mínimo del contrato.
+- **Seguimiento de posiciones virtuales** limitado a `REPLAY_DAYS` días.
+- Los datos diarios asumen velas de 1d alineadas a **00:00 UTC** (como TradingView para cripto); el bot avisa en los logs si no lo parecen.
+- Filtro extra opcional `MIN_QUOTE_VOLUME` (100 000 USDT/24h por defecto); ponlo a `0` para analizar absolutamente todo.
+- Pares con menos de 35 días de histórico se omiten (el Pine daría `na`).
+
+## Solución de problemas
+
+- **No llega nada a Telegram**: revisa token/chat id y que hayas escrito antes al bot. En los logs aparece `Telegram error ...`.
+- **Muy pocas señales**: es normal; EP exige ≥7 % + RVOL ≥1.5x y PS ≥50 % de subida. Usa `/watchlist` y `/analiza` para ver qué falta.
+- **Probar rápido**: `SYMBOL_WHITELIST=BTC,ETH` y umbrales bajos (`EP_MIN_CHANGE=1`, `EP_MIN_ADR=1`, `EP_MIN_RVOL=0.5`).
+- **Sin gráficos**: pon `SEND_CHARTS=false` si quieres reducir memoria/CPU.

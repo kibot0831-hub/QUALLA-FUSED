@@ -1,7 +1,6 @@
+.env
 __pycache__/
 *.pyc
-.env
-*.json
-*.json.bad
-*.tmp
 .venv/
+state.json
+state.json.tmp

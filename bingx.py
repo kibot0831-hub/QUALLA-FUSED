@@ -1,132 +1,105 @@
-"""bingx.py — Cliente REST público de BingX (perpetuos USDT-M). Solo datos de mercado:
-no necesita API key porque el bot SOLO manda señales a Telegram (no opera)."""
-from __future__ import annotations
-
+"""Acceso a BingX (futuros perpetuos USDT) con ccxt asíncrono. Solo datos públicos: no hacen falta API keys."""
+import asyncio
 import logging
-import threading
-import time
 
-import requests
+import ccxt.async_support as ccxt
+import numpy as np
 
-from strategy import Bar
+log = logging.getLogger("bingx")
 
-log = logging.getLogger("qfused.bingx")
-
-BASE_URL = "https://open-api.bingx.com"
+def timeframe_ms(tf):
+    return int(tf[:-1]) * {"m": 60, "h": 3600, "d": 86400}[tf[-1]] * 1000
 
 
-class BingXError(Exception):
-    pass
+RETRY_ERRORS = (ccxt.NetworkError, ccxt.DDoSProtection, ccxt.RateLimitExceeded,
+                ccxt.RequestTimeout, ccxt.ExchangeNotAvailable)
 
 
-class RateLimiter:
-    """Limitador global (todas las hebras): como mucho `rps` peticiones por segundo."""
+class BingX:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.ex = ccxt.bingx({
+            "enableRateLimit": True,
+            "rateLimit": cfg.rate_limit_ms,
+            "timeout": 25000,
+            "options": {"defaultType": "swap"},
+        })
+        self._sem = asyncio.Semaphore(cfg.concurrency)
+        self.symbols = []
 
-    def __init__(self, rps: float):
-        self.interval = 1.0 / max(rps, 0.1)
-        self._lock = threading.Lock()
-        self._next = 0.0
-
-    def wait(self):
-        with self._lock:
-            now = time.monotonic()
-            t = max(now, self._next)
-            self._next = t + self.interval
-        delay = t - now
-        if delay > 0:
-            time.sleep(delay)
-
-
-def _parse_kline(k):
-    """Acepta dict ({time, open, high, low, close, volume}) o lista [t, o, h, l, c, v]."""
-    if isinstance(k, dict):
-        ts = k.get("time", k.get("openTime", k.get("t")))
-        return Bar(int(ts), float(k["open"]), float(k["high"]), float(k["low"]),
-                   float(k["close"]), float(k.get("volume", 0) or 0))
-    return Bar(int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5]))
-
-
-class BingXClient:
-    def __init__(self, rps: float = 8.0, timeout: float = 15.0, base_url: str = BASE_URL):
-        self.base_url = base_url
-        self.timeout = timeout
-        self.limiter = RateLimiter(rps)
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "qfused-bot/1.0"})
-        adapter = requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32)
-        self.session.mount("https://", adapter)
-
-    # ---------------------------------------------------------------- HTTP
-    def _get(self, path: str, params: dict | None = None, retries: int = 4):
-        last = "sin respuesta"
-        for attempt in range(retries):
-            self.limiter.wait()
+    async def _retry(self, fn, *args, tries=4):
+        delay = 2.0
+        for k in range(tries):
             try:
-                r = self.session.get(self.base_url + path, params=params, timeout=self.timeout)
-            except requests.RequestException as e:
-                last = type(e).__name__
-                time.sleep(min(2 ** attempt, 8))
-                continue
-            if r.status_code == 429 or r.status_code >= 500:
-                last = f"HTTP {r.status_code}"
-                time.sleep(min(2 ** (attempt + 1), 15))
-                continue
-            try:
-                data = r.json()
-            except ValueError:
-                last = f"respuesta no JSON (HTTP {r.status_code})"
-                time.sleep(min(2 ** attempt, 8))
-                continue
-            code = data.get("code", 0)
-            if str(code) in ("0", "None", ""):
-                return data.get("data")
-            msg = str(data.get("msg", ""))
-            if str(code) == "100410" or "rate limit" in msg.lower():
-                last = f"rate limit ({code})"
-                time.sleep(min(2 ** (attempt + 1), 15))
-                continue
-            raise BingXError(f"{path} code={code} msg={msg}")
-        raise BingXError(f"{path}: reintentos agotados ({last})")
+                return await fn(*args)
+            except RETRY_ERRORS as e:
+                if k == tries - 1:
+                    raise
+                log.debug("Reintento %s/%s tras %s", k + 1, tries, type(e).__name__)
+                await asyncio.sleep(delay * (3 if isinstance(e, (ccxt.RateLimitExceeded, ccxt.DDoSProtection)) else 1))
+                delay *= 2
 
-    # ------------------------------------------------------------ endpoints
-    def contracts(self) -> list:
-        data = self._get("/openApi/swap/v2/quote/contracts")
-        return data or []
-
-    def tickers(self) -> dict:
-        """symbol → {'last': float, 'qv': volumen 24h en USDT (o None)}"""
-        data = self._get("/openApi/swap/v2/quote/ticker") or []
-        if isinstance(data, dict):
-            data = [data]
-        out = {}
-        for t in data:
-            sym = t.get("symbol")
-            if not sym:
+    async def load_universe(self):
+        """Todos los perpetuos lineales USDT activos de BingX (menos blacklist / solo whitelist si se define)."""
+        await self._retry(self.ex.load_markets, True)
+        syms = []
+        for sym, m in self.ex.markets.items():
+            if not m.get("swap") or m.get("quote") != "USDT" or m.get("inverse"):
                 continue
-            try:
-                qv = float(t["quoteVolume"]) if t.get("quoteVolume") not in (None, "") else None
-            except (TypeError, ValueError):
-                qv = None
-            try:
-                last = float(t.get("lastPrice"))
-            except (TypeError, ValueError):
-                last = None
-            out[sym] = {"last": last, "qv": qv}
-        return out
+            if m.get("active") is False:
+                continue
+            base = str(m.get("base", "")).upper()
+            if self.cfg.whitelist and base not in self.cfg.whitelist:
+                continue
+            if base in self.cfg.blacklist:
+                continue
+            syms.append(sym)
+        self.symbols = sorted(syms)
+        log.info("Universo BingX: %d perpetuos USDT", len(self.symbols))
+        return self.symbols
 
-    def klines(self, symbol: str, interval: str, limit: int = 300) -> list:
-        """Velas ordenadas de la más antigua a la más nueva (incluye la vela en formación)."""
-        params = {"symbol": symbol, "interval": interval, "limit": int(limit)}
+    async def fetch_tickers(self):
+        return await self._retry(self.ex.fetch_tickers)
+
+    async def fetch_ohlcv(self, symbol, timeframe, limit):
+        """Devuelve ndarray [ts, o, h, l, c, v] ordenado y sin duplicados (incluye la vela en formación)."""
+        async with self._sem:
+            raw = await self._retry(self.ex.fetch_ohlcv, symbol, timeframe, None, limit)
+        if not raw:
+            return None
+        arr = np.asarray(raw, dtype=float)
+        arr = arr[~np.isnan(arr).any(axis=1)]
+        if len(arr) == 0:
+            return None
+        arr = arr[np.argsort(arr[:, 0], kind="stable")]
+        _, idx = np.unique(arr[:, 0], return_index=True)
+        return arr[np.sort(idx)]
+
+    async def fetch_ohlcv_range(self, symbol, timeframe, since_ms, until_ms, page=1000):
+        """Histórico paginado [since_ms, until_ms] (para backtest). Incluye protección contra bucles."""
+        tf = timeframe_ms(timeframe)
+        rows, cursor = [], int(since_ms)
+        while cursor < until_ms:
+            async with self._sem:
+                raw = await self._retry(self.ex.fetch_ohlcv, symbol, timeframe, cursor, page,
+                                        {"until": cursor + page * tf})
+            if raw:
+                rows.extend(raw)
+                last = int(raw[-1][0])
+                cursor = max(cursor + tf, last + tf) if last >= cursor else cursor + page * tf
+            else:
+                cursor += page * tf  # hueco sin velas: saltar
+        if not rows:
+            return None
+        arr = np.asarray(rows, dtype=float)
+        arr = arr[~np.isnan(arr).any(axis=1)]
+        arr = arr[np.argsort(arr[:, 0], kind="stable")]
+        _, idx = np.unique(arr[:, 0], return_index=True)
+        arr = arr[np.sort(idx)]
+        return arr[(arr[:, 0] >= since_ms) & (arr[:, 0] < until_ms)]
+
+    async def close(self):
         try:
-            data = self._get("/openApi/swap/v3/quote/klines", params)
-        except BingXError as e:
-            log.debug("v3 klines falló para %s (%s); pruebo v2", symbol, e)
-            data = self._get("/openApi/swap/v2/quote/klines", params)
-        bars = {}
-        for k in data or []:
-            try:
-                b = _parse_kline(k)
-            except (KeyError, TypeError, ValueError):
-                continue
-            bars[b.ts] = b
-        return [bars[t] for t in sorted(bars)]
+            await self.ex.close()
+        except Exception:
+            pass

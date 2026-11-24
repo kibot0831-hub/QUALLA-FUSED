@@ -1,433 +1,359 @@
-"""strategy.py — Port del Pine v6 "Qullamaggie Fused v2 - EP Long + Parabolic Short".
+"""Réplica vela a vela de 'Qullamaggie Fused v2' (EP Long + Parabolic Short).
 
-Reglas de fidelidad con el Pine:
-  · Solo velas CERRADAS (equivale a barstate.isconfirmed).
-  · Datos diarios = valores [1] con lookahead_on: cierre previo, ADR20, volumen medio 20d,
-    EMA10/EMA20 diarias, racha de días verdes y mínimo de los últimos N días, todos
-    calculados con días COMPLETOS anteriores al día actual (sin repintado).
-  · La sesión es el día UTC (cripto 24/7). Opening Range = primeros OR_MINUTES del día.
-  · RVOL a esta hora = volumen acumulado hoy / (volumen medio diario × fracción del día).
-  · Se reproduce el día actual vela a vela (EP armado, trades del día, posición virtual).
+El motor es SIN ESTADO: en cada ciclo se re-simula la ventana reciente (REPLAY_DAYS días)
+desde un inicio de día UTC, igual que haría TradingView. Así el bot se recupera solo
+tras un reinicio y las posiciones virtuales abiertas se siguen hasta su salida.
 """
-from __future__ import annotations
-
 import math
-from collections import namedtuple
-from dataclasses import dataclass, field
-from typing import Optional
 
-Bar = namedtuple("Bar", "ts o h l c v")  # ts = apertura de la vela (ms, UTC)
-MIN_MS = 60_000
+import numpy as np
+
+from indicators import sma, ema, atr, rolling_min, highest_prev
+
 DAY_MS = 86_400_000
+nan = float("nan")
+isnan = math.isnan
+
+EMPTY_CTX = {"prior_close": nan, "adr": nan, "vavg": nan, "e10": nan, "e20": nan, "gs": nan, "base_low": nan}
 
 
-# ═══════════════════════════ Indicadores ═══════════════════════════
-def ema_list(values, n):
-    a = 2.0 / (n + 1)
-    out, e = [], None
-    for x in values:
-        e = x if e is None else a * x + (1 - a) * e
-        out.append(e)
-    return out
+# ═══════════════════════════════════════════════════════════════
+# DATOS DIARIOS (equivalente a request.security(..., "D", f_daily) con [1])
+# ═══════════════════════════════════════════════════════════════
+
+def daily_series(ts, o, h, l, c, v, lookback):
+    """Series diarias a partir de velas diarias YA CERRADAS."""
+    ts = np.asarray(ts, dtype=np.int64)
+    o = np.asarray(o, float)
+    h = np.asarray(h, float)
+    l = np.asarray(l, float)
+    c = np.asarray(c, float)
+    v = np.asarray(v, float)
+    rng = (h - l) / np.maximum(c, 1e-12) * 100.0
+    gs = np.zeros(len(c))
+    run = 0
+    for i in range(len(c)):
+        run = run + 1 if c[i] > o[i] else 0
+        gs[i] = run
+    return {
+        "days": ts // DAY_MS,
+        "h": h,
+        "close": c,
+        "adr": sma(rng, 20),
+        "vavg": sma(v, 20),
+        "e10": ema(c, 10),
+        "e20": ema(c, 20),
+        "gs": gs,
+        "lown": rolling_min(l, lookback),
+    }
 
 
-def atr_list(bars, n=14):
-    """ATR de Wilder (ta.atr = rma del true range)."""
-    out = [None] * len(bars)
-    if len(bars) < n:
-        return out
-    tr = []
-    for i, b in enumerate(bars):
-        if i == 0:
-            tr.append(b.h - b.l)
-        else:
-            pc = bars[i - 1].c
-            tr.append(max(b.h - b.l, abs(b.h - pc), abs(b.l - pc)))
-    r = sum(tr[:n]) / n
-    out[n - 1] = r
-    for i in range(n, len(bars)):
-        r = (r * (n - 1) + tr[i]) / n
-        out[i] = r
-    return out
-
-
-def vwap_list(bars):
-    """VWAP de hlc3 anclado al día UTC (ta.vwap por sesión)."""
-    out, cur, pv, vv = [], None, 0.0, 0.0
-    for b in bars:
-        d = b.ts - b.ts % DAY_MS
-        if d != cur:
-            cur, pv, vv = d, 0.0, 0.0
-        tp = (b.h + b.l + b.c) / 3.0
-        pv += tp * b.v
-        vv += b.v
-        out.append(pv / vv if vv > 0 else tp)
-    return out
-
-
-def highest_prev_list(values, n=10):
-    """ta.highest(x, n)[1]: máximo de las n velas anteriores a la actual."""
-    out = [None] * len(values)
-    for i in range(n, len(values)):
-        out[i] = max(values[i - n:i])
-    return out
-
-
-# ═══════════════════════════ Contexto diario ═══════════════════════════
-@dataclass
-class DailyCtx:
-    day_start: int
-    prior_close: float
-    adr: float            # SMA20 de (high-low)/close*100
-    avg_vol: float        # SMA20 del volumen diario
-    ema10: float
-    ema20: float
-    green_streak: int
-    base_low: float       # mínimo de los últimos `lookback` días completos
-    n_days: int
-
-
-def compute_daily_ctx(daily, day_start, lookback) -> Optional[DailyCtx]:
-    """Contexto diario para el día que empieza en `day_start` (ms UTC).
-    Solo usa velas diarias COMPLETAS (la vela del día en curso se descarta)."""
-    comp = [b for b in daily if b.ts + DAY_MS <= day_start]
-    if len(comp) < max(20, lookback):
+def ctx_for_day(ds, day):
+    """Valores 'confirmados' para un día: los de la última vela diaria cerrada anterior a ese día."""
+    j = int(np.searchsorted(ds["days"], day, side="left")) - 1
+    if j < 0:
         return None
-    if comp[-1].ts + DAY_MS < day_start - DAY_MS:
-        return None  # hueco: el último cierre diario es demasiado viejo
-    last20 = comp[-20:]
-    ratios = [(b.h - b.l) / b.c * 100.0 for b in last20 if b.c > 0]
-    if len(ratios) < 20:
+    return {
+        "prior_close": float(ds["close"][j]),
+        "adr": float(ds["adr"][j]),
+        "vavg": float(ds["vavg"][j]),
+        "e10": float(ds["e10"][j]),
+        "e20": float(ds["e20"][j]),
+        "gs": float(ds["gs"][j]),
+        "base_low": float(ds["lown"][j]),
+    }
+
+
+def could_signal(ctx, hi, cfg):
+    """Pre-filtro CONSERVADOR (superconjunto): ¿podría haber contexto EP/PS si el máximo del día fue `hi`?"""
+    if ctx is None:
+        return False
+    pc = ctx["prior_close"]
+    if not (pc > 0 and hi > 0):
+        return False
+    if cfg.ep_on and ctx["adr"] >= cfg.ep_min_adr and (hi - pc) / pc * 100.0 >= cfg.ep_min_change:
+        return True
+    if cfg.ps_on and ctx["gs"] >= cfg.ps_min_green:
+        bl, e20 = ctx["base_low"], ctx["e20"]
+        if bl > 0 and e20 > 0 and (hi - bl) / bl * 100.0 >= cfg.ps_min_gain and (hi - e20) / e20 * 100.0 >= cfg.ps_min_ext:
+            return True
+    return False
+
+
+def prior_days_potential(ds, cfg, today):
+    """¿Algún día anterior de la ventana de replay pudo generar una señal (y dejar una posición abierta)?"""
+    days = ds["days"]
+    for k in range(1, cfg.replay_days):
+        d = today - k
+        j = int(np.searchsorted(days, d, side="left"))
+        if j < len(days) and days[j] == d and could_signal(ctx_for_day(ds, d), float(ds["h"][j]), cfg):
+            return True
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════
+# ENTRADAS / SALIDAS
+# ═══════════════════════════════════════════════════════════════
+
+def _build_entry(cfg, symbol, side, setup, i, ts_i, tf_ms, close, atr_i, stop_ref, adr,
+                 risk_pct, adr_limit, trigger, extra, levels, trades_today):
+    buf = cfg.sl_buf * atr_i
+    if side == 1:
+        struct = stop_ref - buf
+        dist = close - struct
+    else:
+        struct = stop_ref + buf
+        dist = struct - close
+    adr_dist = adr / 100.0 * close
+    if not (dist > 0 and dist <= adr_dist * adr_limit):  # NaN -> descarta
         return None
-    closes = [b.c for b in comp]
-    gs = 0
-    for b in comp:
-        gs = gs + 1 if b.c > b.o else 0
-    return DailyCtx(
-        day_start=day_start,
-        prior_close=comp[-1].c,
-        adr=sum(ratios) / 20.0,
-        avg_vol=sum(b.v for b in last20) / 20.0,
-        ema10=ema_list(closes, 10)[-1],
-        ema20=ema_list(closes, 20)[-1],
-        green_streak=gs,
-        base_low=min(b.l for b in comp[-lookback:]),
-        n_days=len(comp),
-    )
-
-
-# ═══════════════════════════ Posición / señales ═══════════════════════════
-@dataclass
-class Position:
-    id: str
-    symbol: str
-    setup: str            # "EP Long" | "Parabolic Short"
-    side: str             # "long" | "short"
-    entry: float
-    stop: float           # stop vigente
-    initial_stop: float
-    risk: float           # distancia inicial al stop (1R)
-    target: float         # TP1
-    entry_ts: int
-    last_ts: int
-    partial_taken: bool = False
-    remaining: float = 1.0
-    realized_r: float = 0.0
-    closed: bool = False
-
-
-@dataclass
-class Event:
-    kind: str             # TP1 | STOP | BE | TRAIL | TIME
-    price: float
-    ts: int
-    total_r: float
-
-
-@dataclass
-class Signal:
-    symbol: str
-    setup: str
-    side: str
-    ts: int
-    entry: float
-    stop: float
-    risk: float
-    target: float
-    stop_pct: float
-    tp_pct: float
-    size: dict
-    ctx: dict
-    trigger: str
-    trade_n: int
-
-
-def position_from_signal(sig: Signal) -> Position:
-    return Position(id=f"{sig.symbol}|{sig.ts}", symbol=sig.symbol, setup=sig.setup, side=sig.side,
-                    entry=sig.entry, stop=sig.stop, initial_stop=sig.stop, risk=sig.risk,
-                    target=sig.target, entry_ts=sig.ts, last_ts=sig.ts)
-
-
-def size_position(entry, stop_dist, risk_pct, cfg) -> dict:
-    """Mismo dimensionado que el Pine: riesgo fijo % del equity, tope de nocional."""
-    equity = cfg.account_equity
-    risk_cash = equity * risk_pct / 100.0
-    qty = risk_cash / stop_dist if stop_dist > 0 else 0.0
-    max_qty = equity * cfg.max_pos_pct / 100.0 / entry
+    risk_cash = cfg.account_equity * risk_pct / 100.0
+    qty = risk_cash / dist
+    max_qty = cfg.account_equity * cfg.max_pos_pct / 100.0 / close
     capped = qty > max_qty
     qty = min(qty, max_qty)
-    notional = qty * entry
-    return {"equity": equity, "risk_pct": risk_pct, "risk_cash": risk_cash, "qty": qty,
-            "notional": notional, "notional_pct": notional / equity * 100.0,
-            "real_risk": qty * stop_dist, "capped": capped}
+    if not qty > 0:
+        return None
+    target = close + side * dist * cfg.partial_r
+    pend = {"side": side, "setup": setup, "signal_i": i, "signal_ts": int(ts_i),
+            "stop": struct, "risk": dist, "target": target}
+    ev = {
+        "type": "ENTRY", "symbol": symbol, "setup": setup, "side": side,
+        "signal_ts": int(ts_i), "bar_ts": int(ts_i), "event_ts": int(ts_i) + tf_ms,
+        "entry": float(close), "stop": struct, "risk": dist, "stop_pct": dist / close * 100.0,
+        "tp1": target, "partial_r": cfg.partial_r, "partial_pct": cfg.partial_pct,
+        "qty": qty, "notional": qty * close, "risk_cash": risk_cash, "risk_pct": risk_pct,
+        "capped": capped, "adr": adr, "adr_mult": dist / adr_dist if adr_dist > 0 else nan,
+        "trigger": trigger, "ctx": extra, "levels": levels, "trades_today": trades_today,
+    }
+    return pend, ev
 
 
-def _close_remaining(pos: Position, px: float):
-    sgn = 1 if pos.side == "long" else -1
-    pos.realized_r += pos.remaining * sgn * (px - pos.entry) / pos.risk
-    pos.remaining = 0.0
-    pos.closed = True
-
-
-def advance_position(pos: Position, bar: Bar, cfg, tf_ms: int, first_bar_of_day=False,
-                     prior_close=None, trail_ema=None) -> list:
-    """Aplica UNA vela cerrada a la posición y devuelve los eventos.
-
-    Convenciones (conservadoras, como el broker emulator de TradingView):
-      · Si la vela toca stop y TP1 a la vez, se asume que salta primero el stop.
-      · Si abre con gap más allá del stop, el stop se ejecuta en la apertura.
-      · Tras TP1 el stop pasa a breakeven desde la vela SIGUIENTE.
-      · Trail: al abrir un día nuevo, si el cierre diario previo queda del lado malo de la
-        EMA diaria (solo tras el parcial), se cierra el resto.
-    """
-    ev: list = []
-    if pos.closed or bar.ts <= pos.last_ts:
-        return ev
-    pos.last_ts = bar.ts
-    long = pos.side == "long"
-    sgn = 1 if long else -1
-
-    # 1) stop
-    if (bar.l <= pos.stop) if long else (bar.h >= pos.stop):
-        px = min(pos.stop, bar.o) if long else max(pos.stop, bar.o)
-        kind = "BE" if pos.partial_taken else "STOP"
-        _close_remaining(pos, px)
-        ev.append(Event(kind, px, bar.ts, pos.realized_r))
-        return ev
-
-    # 2) TP1 (parcial)
-    if not pos.partial_taken and ((bar.h >= pos.target) if long else (bar.l <= pos.target)):
-        px = max(pos.target, bar.o) if long else min(pos.target, bar.o)
-        frac = cfg.partial_pct / 100.0
-        pos.realized_r += frac * sgn * (px - pos.entry) / pos.risk
-        pos.remaining -= frac
-        pos.partial_taken = True
-        pos.stop = pos.entry  # BE vigente desde la próxima vela
-        ev.append(Event("TP1", px, bar.ts, pos.realized_r))
-
-    # 3) trail con EMA diaria (solo tras el parcial, al abrir día nuevo)
-    if (cfg.use_trail_ema and first_bar_of_day and pos.partial_taken
-            and prior_close is not None and trail_ema is not None):
-        bad = prior_close < trail_ema if long else prior_close > trail_ema
-        if bad:
-            _close_remaining(pos, bar.c)
-            ev.append(Event("TRAIL", bar.c, bar.ts, pos.realized_r))
-            return ev
-
-    # 4) salida por tiempo
-    if cfg.max_hold_bars > 0 and (bar.ts - pos.entry_ts) // tf_ms >= cfg.max_hold_bars:
-        _close_remaining(pos, bar.c)
-        ev.append(Event("TIME", bar.c, bar.ts, pos.realized_r))
+def _exit_event(symbol, tr, kind, bar_i, bar_ts, px, frac, tf_ms, extra=None):
+    r_part = tr["side"] * (px - tr["fill"]) / tr["risk"]
+    tr["realized_r"] += frac * r_part
+    ev = {
+        "type": kind, "symbol": symbol, "setup": tr["setup"], "side": tr["side"],
+        "signal_ts": tr["signal_ts"], "bar_ts": int(bar_ts), "event_ts": int(bar_ts) + tf_ms,
+        "price": float(px), "frac": frac, "r_part": r_part, "r_total": tr["realized_r"],
+        "fill": tr["fill"], "stop_init": tr["stop"], "tp1": tr["target"], "risk": tr["risk"],
+    }
+    if extra:
+        ev.update(extra)
     return ev
 
 
-# ═══════════════════════════ Evaluación ═══════════════════════════
-@dataclass
-class EvalResult:
-    symbol: str
-    signals: list = field(default_factory=list)
-    ep_armed: bool = False
-    ep_arm_ts: Optional[int] = None
-    ep_arm_info: Optional[dict] = None
-    ps_active: bool = False
-    ps_first_ts: Optional[int] = None
-    ps_info: Optional[dict] = None
-    trades_today: int = 0
-    last: dict = field(default_factory=dict)
+# ═══════════════════════════════════════════════════════════════
+# REPLAY
+# ═══════════════════════════════════════════════════════════════
 
+def replay(symbol, bars, ds, cfg, tf_ms):
+    """bars = (ts, o, h, l, c, v) de velas CERRADAS. Devuelve {'events': [...], 'open_trade': dict|None}."""
+    ts, o, h, l, c, v = bars
+    n = len(ts)
+    out = {"events": [], "open_trade": None}
+    if n < 80:
+        return out
+    events = out["events"]
+    days = ts // DAY_MS
 
-def evaluate(symbol, bars, ctx, cfg, tf_min, blocked=False) -> EvalResult:
-    """Reproduce el día actual (UTC) vela a vela y devuelve las señales generadas.
+    e21 = ema(c, 21)
+    atrv = atr(h, l, c, 14)
+    hh10 = highest_prev(h, 10)
+    hlc3 = (h + l + c) / 3.0
+    vwap = np.empty(n)
+    cpv = cv = 0.0
+    pday = -1
+    for i in range(n):
+        if days[i] != pday:
+            cpv = cv = 0.0
+            pday = days[i]
+        cpv += hlc3[i] * v[i]
+        cv += v[i]
+        vwap[i] = cpv / cv if cv > 0 else hlc3[i]
+    out["series"] = (ts, o, h, l, c, e21, vwap)
 
-    bars    : velas CERRADAS, ascendentes, con histórico previo (warmup) + el día actual.
-    ctx     : DailyCtx del día de la última vela.
-    blocked : hay una posición real abierta en el símbolo → no se generan entradas.
-    """
-    res = EvalResult(symbol=symbol)
-    n = len(bars)
-    if ctx is None or n < 30:
-        return res
-    tf_ms = tf_min * MIN_MS
-    day0 = bars[-1].ts - bars[-1].ts % DAY_MS
-    i0 = 0
-    for k in range(n - 1, -1, -1):
-        if bars[k].ts < day0:
-            i0 = k + 1
+    first_day = int(days[-1]) - cfg.replay_days + 1
+    i0 = None
+    for i in range(40, n):
+        if days[i] != days[i - 1] and days[i] >= first_day:
+            i0 = i
             break
+    if i0 is None:
+        return out
 
-    ema21 = ema_list([b.c for b in bars], 21)
-    atr = atr_list(bars, 14)
-    vwap = vwap_list(bars)
-    hh10 = highest_prev_list([b.h for b in bars], 10)
-
-    ep_on = cfg.setups in ("BOTH", "EP")
-    ps_on = cfg.setups in ("BOTH", "PS")
-    trail_ema = ctx.ema10 if cfg.trail_ema_len == 10 else ctx.ema20
-
-    pos: Optional[Position] = None
-    trades = 0
-    ep_armed = False
-    day_open = day_high = day_low = None
+    ctx = EMPTY_CTX
+    day_open = day_high = day_low = nan
     day_vol = 0.0
-    or_h = or_l = None
+    or_high = or_low = nan
+    prev_or_high = prev_or_low = nan
+    trades_today = 0
+    ep_armed = False
+    pend_entry = None
+    pend_close = False
+    tr = None
 
     for i in range(i0, n):
-        b = bars[i]
-        pb = bars[i - 1] if i > 0 else b
-        pi = i - 1 if i > 0 else 0
-        c, pc = b.c, pb.c
+        day = int(days[i])
+        new_day = (i == i0) or (days[i] != days[i - 1])
+        if new_day:
+            ctx = ctx_for_day(ds, day) or EMPTY_CTX
 
-        # 1) salidas de la posición virtual en esta vela (antes de evaluar señales)
-        if pos is not None:
-            advance_position(pos, b, cfg, tf_ms, first_bar_of_day=(i == i0),
-                             prior_close=ctx.prior_close, trail_ema=trail_ema)
-            if pos.closed:
-                pos = None
+        # ── 1) Órdenes pendientes que se ejecutan al OPEN de esta vela ──
+        if tr is not None and pend_close:
+            tr = None
+            pend_close = False
+        if pend_entry is not None:
+            tr = dict(pend_entry, fill=float(o[i]), stop_cur=pend_entry["stop"], remaining=1.0,
+                      partial_taken=False, be_set=False, realized_r=0.0)
+            pend_entry = None
 
-        # 2) estado diario
-        if i == i0:
-            day_open, day_high, day_low, day_vol = b.o, b.h, b.l, b.v
-            or_h = or_l = None
+        # ── 2) Stops / objetivo durante la vela (si ambos tocan: se asume stop primero = conservador) ──
+        if tr is not None:
+            s = tr["side"]
+            hit_stop = (l[i] <= tr["stop_cur"]) if s == 1 else (h[i] >= tr["stop_cur"])
+            if hit_stop:
+                px = min(tr["stop_cur"], o[i]) if s == 1 else max(tr["stop_cur"], o[i])
+                kind = "BE_STOP" if tr["be_set"] else "STOP"
+                events.append(_exit_event(symbol, tr, kind, i, ts[i], px, tr["remaining"], tf_ms))
+                tr = None
+            elif not tr["partial_taken"] and ((h[i] >= tr["target"]) if s == 1 else (l[i] <= tr["target"])):
+                px = max(tr["target"], o[i]) if s == 1 else min(tr["target"], o[i])
+                frac = cfg.partial_pct / 100.0
+                tr["remaining"] = 1.0 - frac
+                tr["partial_taken"] = True
+                events.append(_exit_event(symbol, tr, "TP1", i, ts[i], px, frac, tf_ms,
+                                          {"remaining": tr["remaining"]}))
+
+        # ── 3) Cálculo al CIERRE de la vela (barstate.isconfirmed) ──
+        mins_from_day = (ts[i] - day * DAY_MS) / 60000.0
+        mins_from_open = mins_from_day - cfg.sess_offset
+        if new_day:
+            day_open, day_high, day_low, day_vol = float(o[i]), float(h[i]), float(l[i]), float(v[i])
+            or_high = or_low = nan
+            trades_today = 0
+            ep_armed = False
         else:
-            day_high = max(day_high, b.h)
-            day_low = min(day_low, b.l)
-            day_vol += b.v
-        p_or_h, p_or_l = or_h, or_l  # valores de la vela anterior (para cruces)
+            day_high = max(day_high, float(h[i]))
+            day_low = min(day_low, float(l[i]))
+            day_vol += float(v[i])
 
-        mfd = (b.ts - day0) / MIN_MS            # minutos desde el inicio del día (apertura de vela)
-        mfo = mfd - cfg.sess_offset_min         # minutos desde la apertura de sesión
-        in_or = 0 <= mfo < cfg.or_minutes
-        or_done = mfo >= cfg.or_minutes
+        in_or = 0 <= mins_from_open < cfg.or_minutes
+        or_done = mins_from_open >= cfg.or_minutes
         if in_or:
-            or_h = b.h if or_h is None else max(or_h, b.h)
-            or_l = b.l if or_l is None else min(or_l, b.l)
+            or_high = float(h[i]) if isnan(or_high) else max(or_high, float(h[i]))
+            or_low = float(l[i]) if isnan(or_low) else min(or_low, float(l[i]))
 
-        frac = min(max(mfd / cfg.day_len_min, 0.05), 1.0)
-        rvol = day_vol / (ctx.avg_vol * frac) if ctx.avg_vol > 0 else None
-        in_window = mfo >= cfg.skip_first_min and (cfg.window_min == 0 or mfo <= cfg.window_min)
+        cl, cl1 = float(c[i]), float(c[i - 1])
+        in_window = mins_from_open >= cfg.skip_first_min and (cfg.window_min == 0 or mins_from_open <= cfg.window_min)
 
-        e21, vw, a, h10 = ema21[i], vwap[i], atr[i], hh10[i]
-        x_orh = (or_h is not None and p_or_h is not None and c > or_h and pc <= p_or_h)
-        x_orl = (or_l is not None and p_or_l is not None and c < or_l and pc >= p_or_l)
-        x_hh = (h10 is not None and hh10[pi] is not None and c > h10 and pc <= hh10[pi])
-        vwap_up = c > e21 and c > vw and pc <= max(ema21[pi], vwap[pi])
-        first_red = c < b.o and pc >= pb.o
-        vwap_fail = c < vw and pc >= vw and b.h >= vw
+        x_orh = (not isnan(or_high)) and (not isnan(prev_or_high)) and cl > or_high and cl1 <= prev_or_high
+        x_orl = (not isnan(or_low)) and (not isnan(prev_or_low)) and cl < or_low and cl1 >= prev_or_low
+        x_hh = (not isnan(hh10[i])) and (not isnan(hh10[i - 1])) and cl > hh10[i] and cl1 <= hh10[i - 1]
+        vwap_up = (cl > e21[i] and cl > vwap[i] and cl1 <= max(e21[i - 1], vwap[i - 1]))
+        first_red = c[i] < o[i] and c[i - 1] >= o[i - 1]
+        vwap_fail = cl < vwap[i] and cl1 >= vwap[i] and h[i] >= vwap[i]
 
-        # 3) contexto EP
-        chg = (c - ctx.prior_close) / ctx.prior_close * 100.0
-        gap = (day_open - ctx.prior_close) / ctx.prior_close * 100.0
-        move = max(chg, gap)
-        ep_context = (move >= cfg.ep_min_change and ctx.adr >= cfg.ep_min_adr
-                      and rvol is not None and rvol >= cfg.ep_min_rvol)
-        just_armed = ep_context and not ep_armed
+        pc = ctx["prior_close"]
+        adr = ctx["adr"]
+        chg = (cl - pc) / pc * 100.0 if pc > 0 else nan
+        gap = (day_open - pc) / pc * 100.0 if pc > 0 else nan
+        move = max(0.0 if isnan(chg) else chg, 0.0 if isnan(gap) else gap)
+        frac_day = min(max(mins_from_day / cfg.day_len, 0.05), 1.0)
+        rvol = day_vol / (ctx["vavg"] * frac_day) if ctx["vavg"] > 0 else nan
+
+        ep_context = move >= cfg.ep_min_change and adr >= cfg.ep_min_adr and rvol >= cfg.ep_min_rvol
+        ep_just_armed = ep_context and not ep_armed
         if ep_context:
             ep_armed = True
 
-        trig_orh = (cfg.ep_trigger == "ORH" and or_done and or_h is not None
-                    and (x_orh or (just_armed and c > or_h)))
-        trig_hh = cfg.ep_trigger == "HH" and x_hh
-        trig_vw = cfg.ep_trigger == "VWAP_EMA" and vwap_up
-        ep_hit = trig_orh or trig_hh or trig_vw
+        ep_trig = None
+        if cfg.ep_trigger == "ORH" and or_done and (x_orh or (ep_just_armed and cl > or_high)):
+            ep_trig = "ORH · ruptura del máximo del Opening Range"
+        elif cfg.ep_trigger == "HH" and x_hh:
+            ep_trig = "HH · ruptura del máximo de las últimas 10 velas"
+        elif cfg.ep_trigger == "VWAP_EMA" and vwap_up:
+            ep_trig = "VWAP/EMA · recuperación de VWAP y EMA21"
 
-        # 4) contexto Parabolic Short
-        gain = (c - ctx.base_low) / ctx.base_low * 100.0 if ctx.base_low > 0 else None
-        ext = (c - ctx.ema20) / ctx.ema20 * 100.0 if ctx.ema20 > 0 else None
-        ps_context = (gain is not None and ext is not None and gain >= cfg.ps_min_gain
-                      and ctx.green_streak >= cfg.ps_min_green and ext >= cfg.ps_min_ext)
-        ps_hit = ((cfg.ps_trigger == "ORL" and or_done and x_orl)
-                  or (cfg.ps_trigger == "FIRST_RED" and first_red)
-                  or (cfg.ps_trigger == "VWAP_FAIL" and vwap_fail))
+        bl, e20 = ctx["base_low"], ctx["e20"]
+        gain = (cl - bl) / bl * 100.0 if bl > 0 else nan
+        ext = (cl - e20) / e20 * 100.0 if e20 > 0 else nan
+        ps_context = gain >= cfg.ps_min_gain and ctx["gs"] >= cfg.ps_min_green and ext >= cfg.ps_min_ext
 
-        def snap():
-            return {"price": c, "prior_close": ctx.prior_close, "chg": chg, "gap": gap,
-                    "rvol": rvol, "adr": ctx.adr, "or_h": or_h, "or_l": or_l, "vwap": vw,
-                    "ema21": e21, "atr": a, "day_high": day_high, "day_low": day_low,
-                    "day_open": day_open, "gain": gain, "ext": ext, "green": ctx.green_streak,
-                    "base_low": ctx.base_low, "ema10d": ctx.ema10, "ema20d": ctx.ema20,
-                    "lookback": cfg.ps_lookback}
+        ps_trig = None
+        if cfg.ps_trigger == "ORL" and or_done and x_orl:
+            ps_trig = "ORL · ruptura del mínimo del Opening Range"
+        elif cfg.ps_trigger == "FIRST_RED" and first_red:
+            ps_trig = "First Red · primera vela roja tras vela verde"
+        elif cfg.ps_trigger == "VWAP_FAIL" and vwap_fail:
+            ps_trig = "VWAP Fail · pérdida de VWAP"
 
-        if ep_context and just_armed and res.ep_arm_ts is None:
-            res.ep_arm_ts = b.ts
-            info = snap()
-            ref = (day_low if cfg.stop_mode == "DAY" else or_l if cfg.stop_mode == "OR"
-                   else c - 2 * a if a is not None else None)
-            info["stop_est"] = ref - cfg.sl_buf * a if (ref is not None and a is not None) else None
-            res.ep_arm_info = info
-        if ps_context and res.ps_first_ts is None:
-            res.ps_first_ts = b.ts
-            res.ps_info = snap()
+        can_trade = tr is None and pend_entry is None and trades_today < cfg.max_trades_day and in_window
+        ep_signal = can_trade and cfg.ep_on and ep_armed and ep_trig is not None
+        ps_signal = can_trade and cfg.ps_on and ps_context and ps_trig is not None and not ep_signal
 
-        # 5) señales
-        can_trade = (pos is None and not blocked and trades < cfg.max_trades_day and in_window)
-        ep_signal = can_trade and ep_on and ep_armed and ep_hit
-        ps_signal = can_trade and ps_on and ps_context and ps_hit and not ep_signal
-        adr_dist = ctx.adr / 100.0 * c
+        levels = {"or_high": or_high, "or_low": or_low, "vwap": float(vwap[i]), "ema21": float(e21[i]),
+                  "e10": ctx["e10"], "e20": ctx["e20"], "day_high": day_high, "day_low": day_low}
 
-        if ep_signal and a is not None:
-            ref = day_low if cfg.stop_mode == "DAY" else or_l if cfg.stop_mode == "OR" else c - 2 * a
-            if ref is not None:
-                struct = ref - cfg.sl_buf * a
-                dist = c - struct
-                if 0 < dist <= adr_dist * cfg.max_adr_mult:
-                    trades += 1
-                    if trig_orh:
-                        why = "Cierre rompe el máximo del Opening Range (ORH)"
-                    elif trig_hh:
-                        why = "Cierre rompe el máximo de las últimas 10 velas"
-                    else:
-                        why = "Cierre recupera VWAP y EMA21"
-                    sig = Signal(symbol, "EP Long", "long", b.ts, c, struct, dist,
-                                 c + dist * cfg.partial_r, dist / c * 100.0,
-                                 dist * cfg.partial_r / c * 100.0,
-                                 size_position(c, dist, cfg.risk_pct_ep, cfg), snap(), why, trades)
-                    res.signals.append(sig)
-                    pos = position_from_signal(sig)
+        if ep_signal or ps_signal:
+            if ep_signal:
+                side, setup, trig = 1, "EP Long", ep_trig
+                ref = day_low if cfg.stop_mode == "DAY" else or_low if cfg.stop_mode == "OR" else cl - 2 * atrv[i]
+                risk_pct, adr_lim = cfg.risk_pct_ep, cfg.max_adr_mult
+                extra = {"move": move, "chg": chg, "gap": gap, "rvol": rvol, "adr": adr}
+            else:
+                side, setup, trig = -1, "Parabolic Short", ps_trig
+                ref = day_high if cfg.stop_mode == "DAY" else or_high if cfg.stop_mode == "OR" else cl + 2 * atrv[i]
+                risk_pct, adr_lim = cfg.risk_pct_short, cfg.max_adr_mult * 1.2
+                extra = {"gain": gain, "gs": ctx["gs"], "ext": ext, "adr": adr, "rvol": rvol}
+            built = _build_entry(cfg, symbol, side, setup, i, ts[i], tf_ms, cl, float(atrv[i]), ref, adr,
+                                 risk_pct, adr_lim, trig, extra, levels, trades_today + 1)
+            if built is not None:
+                pend_entry, ev = built
+                trades_today += 1
+                events.append(ev)
 
-        if ps_signal and a is not None:
-            ref = day_high if cfg.stop_mode == "DAY" else or_h if cfg.stop_mode == "OR" else c + 2 * a
-            if ref is not None:
-                struct = ref + cfg.sl_buf * a
-                dist = struct - c
-                if 0 < dist <= adr_dist * cfg.max_adr_mult * 1.2:
-                    trades += 1
-                    if cfg.ps_trigger == "ORL":
-                        why = "Cierre pierde el mínimo del Opening Range (ORL)"
-                    elif cfg.ps_trigger == "FIRST_RED":
-                        why = "Primera vela roja tras vela verde"
-                    else:
-                        why = "Rechazo bajista en VWAP"
-                    sig = Signal(symbol, "Parabolic Short", "short", b.ts, c, struct, dist,
-                                 c - dist * cfg.partial_r, dist / c * 100.0,
-                                 dist * cfg.partial_r / c * 100.0,
-                                 size_position(c, dist, cfg.risk_pct_short, cfg), snap(), why, trades)
-                    res.signals.append(sig)
-                    pos = position_from_signal(sig)
+        # ── 4) Gestión de la posición al cierre (inTrade) ──
+        if tr is not None:
+            if tr["partial_taken"] and not tr["be_set"]:
+                tr["stop_cur"] = tr["fill"]  # stop a break-even desde la vela siguiente
+                tr["be_set"] = True
+            if tr["partial_taken"] and cfg.use_trail_ema and new_day and not pend_close:
+                trail = ctx["e10"] if cfg.trail_ema_len == 10 else ctx["e20"]
+                if not isnan(trail) and not isnan(pc):
+                    bad = (pc < trail) if tr["side"] == 1 else (pc > trail)
+                    if bad:
+                        events.append(_exit_event(symbol, tr, "TRAIL", i, ts[i], cl, tr["remaining"], tf_ms,
+                                                  {"trail_ema": trail, "prior_close": pc,
+                                                   "ema_len": cfg.trail_ema_len}))
+                        pend_close = True
+            if cfg.max_hold_bars > 0 and i - tr["signal_i"] >= cfg.max_hold_bars and not pend_close:
+                events.append(_exit_event(symbol, tr, "TIME", i, ts[i], cl, tr["remaining"], tf_ms))
+                pend_close = True
 
         if i == n - 1:
-            res.last = snap()
-            res.last.update({"in_window": in_window, "or_done": or_done, "bar_ts": b.ts})
-            res.ep_armed = ep_armed
-            res.ps_active = ps_context
-            res.trades_today = trades
-    return res
+            out["diag"] = {
+                "ts": int(ts[i]), "close": cl, "prior_close": pc, "move": move, "chg": chg, "gap": gap,
+                "rvol": rvol, "adr": adr, "ep_armed": bool(ep_armed), "ep_context": bool(ep_context),
+                "ep_trig": ep_trig is not None, "gain": gain, "gs": ctx["gs"], "ext": ext,
+                "ps_context": bool(ps_context), "ps_trig": ps_trig is not None, "in_window": bool(in_window),
+                "or_done": bool(or_done), "or_high": or_high, "or_low": or_low, "vwap": float(vwap[i]),
+                "ema21": float(e21[i]), "e10": ctx["e10"], "e20": ctx["e20"], "day_high": day_high,
+                "day_low": day_low, "trades_today": trades_today, "in_trade": tr is not None,
+            }
+
+        prev_or_high, prev_or_low = or_high, or_low
+
+    # Posición virtual abierta (o señal en la última vela pendiente de ejecutarse)
+    if tr is not None and not pend_close:
+        out["open_trade"] = {"symbol": symbol, "setup": tr["setup"], "side": tr["side"], "fill": tr["fill"],
+                             "stop": tr["stop_cur"], "tp1": tr["target"], "partial_taken": tr["partial_taken"],
+                             "signal_ts": tr["signal_ts"], "pending": False, "risk": tr["risk"],
+                             "stop_init": tr["stop"], "realized_r": tr["realized_r"], "remaining": tr["remaining"]}
+    elif pend_entry is not None:
+        out["open_trade"] = {"symbol": symbol, "setup": pend_entry["setup"], "side": pend_entry["side"],
+                             "fill": float(c[-1]), "stop": pend_entry["stop"], "tp1": pend_entry["target"],
+                             "partial_taken": False, "signal_ts": pend_entry["signal_ts"], "pending": True,
+                             "risk": pend_entry["risk"], "stop_init": pend_entry["stop"], "realized_r": 0.0,
+                             "remaining": 1.0}
+    return out
